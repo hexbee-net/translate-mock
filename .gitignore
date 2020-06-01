@@ -1,0 +1,38 @@
+### Go
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*/bin
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool, specifically when used with LiteIDE
+*.out
+*/test/coverage*/
+
+# Generated mock files
+mock_*.go
+
+# Dependency directories (remove the comment below to include it)
+# vendor/
+
+### VisualStudioCode
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+*.code-workspace
+
+### JetBrains
+.idea
+*.iml
+*.iws
+out/
+
+### Misc
+.envrc
