@@ -31,13 +31,16 @@ import (
 const Version = "0.0.1"
 
 const (
-	flagPort                = "port"
-	flagDebug               = "debug"
-	flagStartDelay          = "start-delay"
-	flagStopDelay           = "stop-delay"
-	flagThrottlingThreshold = "throttling-threshold"
-	flagThrottlingPeriod    = "throttling-period"
-	flagErrorRate           = "error-rate"
+	flagPort                 = "port"
+	flagDebug                = "debug"
+	flagJobDuration          = "job-duration"
+	flagJobDurationDeviation = "job-deviation"
+	flagStartDelay           = "start-delay"
+	flagStopDelay            = "stop-delay"
+	flagThrottlingThreshold  = "throttling-threshold"
+	flagThrottlingPeriod     = "throttling-period"
+	flagErrorRate            = "error-rate"
+	flagFailRate             = "faile-rate"
 )
 
 func main() {
@@ -53,11 +56,14 @@ func main() {
 	root.Flags().IntP(flagPort, "p", 4670, "Port for the http server to listen on.")
 	root.Flags().Bool(flagDebug, false, "Display debug messages")
 
+	root.Flags().DurationP(flagJobDuration, "d", 10*time.Second, "Time for a job to reach completion one it is started.")
+	root.Flags().DurationP(flagJobDurationDeviation, "v", 0, "Amount by which the time to completion is allowed to change.")
 	root.Flags().DurationP(flagStartDelay, "a", 1*time.Second, "Delay between when a job is submitted and when it actually starts.")
 	root.Flags().DurationP(flagStopDelay, "o", 1*time.Second, "Delay between when a job stop is requested and when the job actually stops.")
 	root.Flags().IntP(flagThrottlingThreshold, "r", 0, "Max number of calls authorized during the throttling period. 0 means not throttling.")
 	root.Flags().DurationP(flagThrottlingPeriod, "t", 0, "Duration of the throttling period. If the number of calls exceeds throttling-threshold during this period, the call will fail.")
 	root.Flags().VarP(PercentValue{}, flagErrorRate, "e", "Percentage of documents with errors on completion for each job.")
+	root.Flags().VarP(PercentValue{}, flagFailRate, "f", "Probability of jobs failure in each update cycle.")
 
 	root.AddCommand(&cobra.Command{
 		Use:   "generate-jobs-skeleton",
@@ -115,11 +121,14 @@ func loadConfig(flags *pflag.FlagSet) Config {
 		return v
 	}
 	config := Config{
-		StartDelay:          mustDuration(flagStartDelay),
-		StopDelay:           mustDuration(flagStopDelay),
-		ThrottlingThreshold: mustInt(flagThrottlingThreshold),
-		ThrottlingPeriod:    mustDuration(flagThrottlingPeriod),
-		ErrorRate:           mustPercent(flagErrorRate),
+		JobDuration:          mustDuration(flagJobDuration),
+		JobDurationDeviation: mustDuration(flagJobDurationDeviation),
+		StartDelay:           mustDuration(flagStartDelay),
+		StopDelay:            mustDuration(flagStopDelay),
+		ThrottlingThreshold:  mustInt(flagThrottlingThreshold),
+		ThrottlingPeriod:     mustDuration(flagThrottlingPeriod),
+		ErrorRate:            float64(mustPercent(flagErrorRate)) / 100,
+		FailRate:             mustPercent(flagFailRate),
 	}
 	return config
 }

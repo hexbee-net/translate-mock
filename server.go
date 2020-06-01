@@ -15,7 +15,6 @@
 package main
 
 import (
-	"container/ring"
 	"encoding/json"
 	"fmt"
 	"github.com/apex/log"
@@ -23,8 +22,8 @@ import (
 	"github.com/aws/aws-sdk-go/service/translate"
 	"github.com/davecgh/go-spew/spew"
 	"github.com/pkg/errors"
+	"io"
 	"net/http"
-	"strconv"
 	"strings"
 	"time"
 )
@@ -48,23 +47,18 @@ type AWSRequest struct {
 }
 
 type Server struct {
-	Config Config
-
-	mux   *http.ServeMux
-	jobs  map[string]*translate.TextTranslationJobProperties
-	calls *ring.Ring
+	Config    Config
+	mux       *http.ServeMux
+	scheduler Scheduler
+	throttler Throttler
 }
 
 func NewServer(config Config, jobs ...translate.TextTranslationJobProperties) *Server {
 	s := Server{
-		Config: config,
-		mux:    http.NewServeMux(),
-		jobs:   make(map[string]*translate.TextTranslationJobProperties),
-		calls:  ring.New(config.ThrottlingThreshold),
-	}
-
-	for _, job := range jobs {
-		s.jobs[*job.JobId] = &job
+		Config:    config,
+		mux:       http.NewServeMux(),
+		scheduler: NewJobScheduler(&config, jobs...),
+		throttler: NewCallThrottler(&config),
 	}
 
 	s.mux.HandleFunc("/", s.HandleRequest)
@@ -78,122 +72,64 @@ func (s *Server) Run(port int) {
 }
 
 func (s *Server) HandleRequest(writer http.ResponseWriter, request *http.Request) {
-	s.UpdateJobs()
-	if s.checkThrottling() {
-		awsError(writer, errors.Errorf("number of calls exceeded %d", s.Config.ThrottlingThreshold), "TooManyRequestsException", http.StatusBadRequest)
-		return
-	}
+	UpdateScheduler(s.scheduler)
 
 	awsRequest, err := parseAWSHeaders(request)
 	if err != nil {
 		awsError(writer, err, "InvalidQueryParameter", http.StatusBadRequest)
 		return
 	}
+	log.Debugf("received action=%s, version=%s, date=%d", awsRequest.Action, awsRequest.Version, awsRequest.Date)
 
-	defer s.pushCall()
-
-	decoder := json.NewDecoder(request.Body)
 	switch awsRequest.Action {
-	case opDeleteTerminology:
-		var input translate.DeleteTerminologyInput
-		if err := decoder.Decode(&input); err != nil {
-			awsError(writer, err, "InvalidQueryParameter", http.StatusBadRequest)
-		}
-		s.HandleDeleteTerminology(writer, input)
-	case opDescribeTextTranslationJob:
-		var input translate.DescribeTextTranslationJobInput
-		if err := decoder.Decode(&input); err != nil {
-			awsError(writer, err, "InvalidQueryParameter", http.StatusBadRequest)
-		}
-		s.HandleDescribeTextTranslationJob(writer, input)
-	case opGetTerminology:
-		var input translate.GetTerminologyInput
-		if err := decoder.Decode(&input); err != nil {
-			awsError(writer, err, "InvalidQueryParameter", http.StatusBadRequest)
-		}
-		s.HandleGetTerminology(writer, input)
-	case opImportTerminology:
-		var input translate.ImportTerminologyInput
-		if err := decoder.Decode(&input); err != nil {
-			awsError(writer, err, "InvalidQueryParameter", http.StatusBadRequest)
-		}
-		s.HandleImportTerminology(writer, input)
-	case opListTerminologies:
-		var input translate.ListTerminologiesInput
-		if err := decoder.Decode(&input); err != nil {
-			awsError(writer, err, "InvalidQueryParameter", http.StatusBadRequest)
-		}
-		s.HandleListTerminologies(writer, input)
-	case opListTextTranslationJobs:
-		var input translate.ListTextTranslationJobsInput
-		if err := decoder.Decode(&input); err != nil {
-			awsError(writer, err, "InvalidQueryParameter", http.StatusBadRequest)
-		}
-		s.HandleListTextTranslationJobs(writer, input)
-	case opStartTextTranslationJob:
-		var input translate.StartTextTranslationJobInput
-		if err := decoder.Decode(&input); err != nil {
-			awsError(writer, err, "InvalidQueryParameter", http.StatusBadRequest)
-		}
-		s.HandleStartTextTranslationJob(writer, input)
-	case opStopTextTranslationJob:
-		var input translate.StopTextTranslationJobInput
-		if err := decoder.Decode(&input); err != nil {
-			awsError(writer, err, "InvalidQueryParameter", http.StatusBadRequest)
-		}
-		s.HandlerStopTextTranslationJob(writer, input)
 	case opTranslateText:
-		var input translate.TextInput
-		if err := decoder.Decode(&input); err != nil {
-			awsError(writer, err, "InvalidQueryParameter", http.StatusBadRequest)
-		}
-		s.HandleTranslateText(writer, input)
+		s.HandleAPICall(writer, request.Body, &translate.TextInput{}, s.HandleTranslateText)
+	case opStartTextTranslationJob:
+		s.HandleAPICall(writer, request.Body, &translate.StartTextTranslationJobInput{}, s.HandleStartTextTranslationJob)
+	case opStopTextTranslationJob:
+		s.HandleAPICall(writer, request.Body, &translate.StopTextTranslationJobInput{}, s.HandlerStopTextTranslationJob)
+	case opListTextTranslationJobs:
+		s.HandleAPICall(writer, request.Body, &translate.ListTextTranslationJobsInput{}, s.HandleListTextTranslationJobs)
+	case opDescribeTextTranslationJob:
+		s.HandleAPICall(writer, request.Body, &translate.DescribeTextTranslationJobInput{}, s.HandleDescribeTextTranslationJob)
+	case opImportTerminology:
+		s.HandleAPICall(writer, request.Body, &translate.ImportTerminologyInput{}, s.HandleImportTerminology)
+	case opListTerminologies:
+		s.HandleAPICall(writer, request.Body, &translate.ListTerminologiesInput{}, s.HandleListTerminologies)
+	case opGetTerminology:
+		s.HandleAPICall(writer, request.Body, &translate.GetTerminologyInput{}, s.HandleGetTerminology)
+	case opDeleteTerminology:
+		s.HandleAPICall(writer, request.Body, &translate.DeleteTerminologyInput{}, s.HandleDeleteTerminology)
 	default:
 		awsError(writer, errors.Errorf("unrecognized action: %s", awsRequest.Action), "InvalidAction", http.StatusBadRequest)
 	}
 }
 
-func (s *Server) UpdateJobs() {
-	log.Debug("updating jobs")
-	for _, job := range s.jobs {
-		//TODO: Use the duration from config instead of now to update the jobs
-		spew.Dump(job)
-	}
-}
-
-func (s *Server) checkThrottling() bool {
-	if s.Config.ThrottlingThreshold == 0 {
-		return false
-	}
-
-	var (
-		calls     int
-		threshold = time.Now().Add(-1 * s.Config.ThrottlingPeriod)
-	)
-	for i := 0; i < s.calls.Len(); i++ {
-		callTime := s.calls.Value.(time.Time)
-		if callTime.After(threshold) {
-			calls++
-		}
-	}
-
-	if calls > s.Config.ThrottlingThreshold {
-		return true
-	}
-	return false
-}
-
-func (s *Server) pushCall() {
-	s.calls.Value = time.Now()
-	s.calls = s.calls.Next()
-}
-
 ////////////////////////////////////////////////////////////////////////////////
 
-func (s *Server) HandleTranslateText(writer http.ResponseWriter, input translate.TextInput) {
-	log.Infof("Action: TranslateText (%s->%s)", *input.SourceLanguageCode, *input.TargetLanguageCode)
+func (s *Server) HandleAPICall(writer http.ResponseWriter, reader io.Reader, input interface{}, handler func(writer http.ResponseWriter, input interface{})) {
+	if s.throttler.CheckThrottling() {
+		awsError(writer, errors.Errorf("number of calls exceeded %d", s.Config.ThrottlingThreshold), "TooManyRequestsException", http.StatusBadRequest)
+		return
+	}
+
+	decoder := json.NewDecoder(reader)
+	if err := decoder.Decode(input); err != nil {
+		awsError(writer, err, "InvalidQueryParameter", http.StatusBadRequest)
+		return
+	}
+
+	s.throttler.PushCall()
+	handler(writer, input)
+}
+
+func (s *Server) HandleTranslateText(writer http.ResponseWriter, in interface{}) {
+	input := in.(*translate.TextInput)
+	log.Info("handle: TranslateText")
+	log.Debugf("TranslateText(%s)", spew.Sdump(input))
 
 	terminologies := make([]*translate.AppliedTerminology, 0, len(input.TerminologyNames))
+
 	for _, t := range input.TerminologyNames {
 		var terms = []*translate.Term{
 			{
@@ -216,13 +152,13 @@ func (s *Server) HandleTranslateText(writer http.ResponseWriter, input translate
 	writeOutput(writer, output)
 }
 
-func (s *Server) HandleStartTextTranslationJob(writer http.ResponseWriter, input translate.StartTextTranslationJobInput) {
-	log.Info("Action: StartTextTranslationJob")
+func (s *Server) HandleStartTextTranslationJob(writer http.ResponseWriter, in interface{}) {
+	input := in.(*translate.StartTextTranslationJobInput)
+	log.Info("handle: StartTextTranslationJob")
+	log.Debugf("StartTextTranslationJob(%s)", spew.Sdump(input))
 
 	now := time.Now()
-	jobID := strconv.Itoa(len(s.jobs))
 	job := translate.TextTranslationJobProperties{
-		JobId:               aws.String(jobID),
 		JobName:             input.JobName,
 		SourceLanguageCode:  input.SourceLanguageCode,
 		TargetLanguageCodes: input.TargetLanguageCodes,
@@ -236,13 +172,13 @@ func (s *Server) HandleStartTextTranslationJob(writer http.ResponseWriter, input
 		Message:             nil,
 		JobDetails: &translate.JobDetails{
 			DocumentsWithErrorsCount: aws.Int64(0),
-			InputDocumentsCount:      aws.Int64(10),
+			InputDocumentsCount:      aws.Int64(0),
 			TranslatedDocumentsCount: aws.Int64(0),
 		},
 	}
 
-	s.jobs[jobID] = &job
-	log.Infof("job started: %s", spew.Sprint(job))
+	jobID := s.scheduler.AddJobStartRequest(&job, now)
+	log.Infof("%s: job submitted", jobID)
 
 	writeOutput(writer, translate.StartTextTranslationJobOutput{
 		JobId:     job.JobId,
@@ -250,35 +186,40 @@ func (s *Server) HandleStartTextTranslationJob(writer http.ResponseWriter, input
 	})
 }
 
-func (s *Server) HandleListTextTranslationJobs(writer http.ResponseWriter, input translate.ListTextTranslationJobsInput) {
-	log.Infof("Action: ListTextTranslationJobs")
+func (s *Server) HandlerStopTextTranslationJob(writer http.ResponseWriter, in interface{}) {
+	input := in.(*translate.StopTextTranslationJobInput)
+	log.Info("action: StopTextTranslationJob")
+	log.Debugf("StopTextTranslationJob(%s)", spew.Sdump(input))
 
-	jobs := []*translate.TextTranslationJobProperties{
-		{
-			DataAccessRoleArn: nil,
-			EndTime:           &time.Time{},
-			InputDataConfig: &translate.InputDataConfig{
-				ContentType: nil,
-				S3Uri:       nil,
-			},
-			JobDetails: &translate.JobDetails{
-				DocumentsWithErrorsCount: nil,
-				InputDocumentsCount:      nil,
-				TranslatedDocumentsCount: nil,
-			},
-			JobId:     nil,
-			JobName:   nil,
-			JobStatus: nil,
-			Message:   nil,
-			OutputDataConfig: &translate.OutputDataConfig{
-				S3Uri: nil,
-			},
-			SourceLanguageCode:  nil,
-			SubmittedTime:       &time.Time{},
-			TargetLanguageCodes: nil,
-			TerminologyNames:    nil,
-		},
+	jobID := *input.JobId
+	job, ok := s.scheduler.Jobs()[jobID]
+	if !ok {
+		awsError(writer, errors.Errorf("stop: job '%s' was not found", *input.JobId), "ResourceNotFoundException", http.StatusBadRequest)
+		return
 	}
+
+	s.scheduler.AddJobStopRequest(job, time.Now())
+	job.JobStatus = aws.String(translate.JobStatusStopRequested)
+
+	writeOutput(writer, translate.StopTextTranslationJobOutput{
+		JobId:     input.JobId,
+		JobStatus: job.JobStatus,
+	})
+}
+
+func (s *Server) HandleListTextTranslationJobs(writer http.ResponseWriter, in interface{}) {
+	input := in.(*translate.ListTextTranslationJobsInput)
+	log.Info("handle: ListTextTranslationJobs")
+	log.Debugf("ListTextTranslationJobs(%s)", spew.Sdump(input))
+
+	//TODO: use Filter, MaxResults and NextToken
+	schedulerJobs := s.scheduler.Jobs()
+	jobs := make([]*translate.TextTranslationJobProperties, 0, len(schedulerJobs))
+	for _, job := range schedulerJobs {
+		jobs = append(jobs, job)
+	}
+
+	//TODO: manage token
 	output := translate.ListTextTranslationJobsOutput{
 		NextToken:                        aws.String("test-token"),
 		TextTranslationJobPropertiesList: jobs,
@@ -286,98 +227,55 @@ func (s *Server) HandleListTextTranslationJobs(writer http.ResponseWriter, input
 	writeOutput(writer, output)
 }
 
-func (s *Server) HandleDescribeTextTranslationJob(writer http.ResponseWriter, input translate.DescribeTextTranslationJobInput) {
-	log.Infof("Action: DescribeTextTranslationJob")
-	job, ok := s.jobs[*input.JobId]
+func (s *Server) HandleDescribeTextTranslationJob(writer http.ResponseWriter, in interface{}) {
+	input := in.(*translate.DescribeTextTranslationJobInput)
+	log.Info("handle: DescribeTextTranslationJob")
+	log.Debugf("DescribeTextTranslationJob(%s)", spew.Sdump(input))
+
+	jobID := *input.JobId
+	job, ok := s.scheduler.Jobs()[jobID]
 	if !ok {
-		awsError(writer, errors.Errorf("job '%s' was not found", *input.JobId), "ResourceNotFoundException", http.StatusBadRequest)
+		awsError(writer, errors.Errorf("describe: job '%s' was not found", jobID), "ResourceNotFoundException", http.StatusBadRequest)
 		return
 	}
 
 	writeOutput(writer, *job)
 }
 
-func (s *Server) HandlerStopTextTranslationJob(writer http.ResponseWriter, input translate.StopTextTranslationJobInput) {
-	log.Infof("Action: StopTextTranslationJob %s", *input.JobId)
-	job, ok := s.jobs[*input.JobId]
-	if !ok {
-		awsError(writer, errors.Errorf("job '%s' was not found", *input.JobId), "ResourceNotFoundException", http.StatusBadRequest)
-		return
-	}
-	job.JobStatus = aws.String(translate.JobStatusStopRequested)
+func (s *Server) HandleImportTerminology(writer http.ResponseWriter, in interface{}) {
+	input := in.(*translate.ImportTerminologyInput)
+	log.Info("action: ImportTerminology")
+	log.Debugf("ImportTerminology(%s)", spew.Sdump(input))
 
-	output := translate.StopTextTranslationJobOutput{
-		JobId:     input.JobId,
-		JobStatus: job.JobStatus,
-	}
+	output := translate.ImportTerminologyOutput{}
 	writeOutput(writer, output)
 }
 
-func (s *Server) HandleImportTerminology(writer http.ResponseWriter, input translate.ImportTerminologyInput) {
-	log.Infof("Action: ImportTerminology")
+func (s *Server) HandleListTerminologies(writer http.ResponseWriter, in interface{}) {
+	input := in.(*translate.ListTerminologiesInput)
+	log.Info("action: ListTerminologies")
+	log.Debugf("ListTerminologies(%s)", spew.Sdump(input))
 
-	output := translate.ImportTerminologyOutput{
-		TerminologyProperties: &translate.TerminologyProperties{
-			Arn:         nil,
-			CreatedAt:   &time.Time{},
-			Description: nil,
-			EncryptionKey: &translate.EncryptionKey{
-				Id:   nil,
-				Type: nil,
-			},
-			LastUpdatedAt:       &time.Time{},
-			Name:                nil,
-			SizeBytes:           nil,
-			SourceLanguageCode:  nil,
-			TargetLanguageCodes: nil,
-			TermCount:           nil,
-		},
-	}
-	writeOutput(writer, output)
+	//output := translate.ListTerminologiesOutput{}
+	//writeOutput(writer, output)
 }
 
-func (s *Server) HandleListTerminologies(writer http.ResponseWriter, input translate.ListTerminologiesInput) {
-	log.Infof("Action: ListTerminologies")
+func (s *Server) HandleGetTerminology(writer http.ResponseWriter, in interface{}) {
+	input := in.(*translate.GetTerminologyInput)
+	log.Info("action: GetTerminology")
+	log.Debugf("GetTerminology(%s)", spew.Sdump(input))
 
-	output := translate.ListTerminologiesOutput{
-		NextToken:                 nil,
-		TerminologyPropertiesList: nil,
-	}
-	writeOutput(writer, output)
+	//output := translate.GetTerminologyOutput{}
+	//writeOutput(writer, output)
 }
 
-func (s *Server) HandleGetTerminology(writer http.ResponseWriter, input translate.GetTerminologyInput) {
-	log.Infof("Action: GetTerminology")
+func (s *Server) HandleDeleteTerminology(writer http.ResponseWriter, in interface{}) {
+	input := in.(*translate.DeleteTerminologyInput)
+	log.Info("action: DeleteTerminology")
+	log.Debugf("DeleteTerminology(%s)", spew.Sdump(input))
 
-	output := translate.GetTerminologyOutput{
-		TerminologyDataLocation: &translate.TerminologyDataLocation{
-			Location:       nil,
-			RepositoryType: nil,
-		},
-		TerminologyProperties: &translate.TerminologyProperties{
-			Arn:         nil,
-			CreatedAt:   &time.Time{},
-			Description: nil,
-			EncryptionKey: &translate.EncryptionKey{
-				Id:   nil,
-				Type: nil,
-			},
-			LastUpdatedAt:       &time.Time{},
-			Name:                nil,
-			SizeBytes:           nil,
-			SourceLanguageCode:  nil,
-			TargetLanguageCodes: nil,
-			TermCount:           nil,
-		},
-	}
-	writeOutput(writer, output)
-}
-
-func (s *Server) HandleDeleteTerminology(writer http.ResponseWriter, input translate.DeleteTerminologyInput) {
-	log.Infof("Action: DeleteTerminology")
-
-	output := translate.DeleteTerminologyOutput{}
-	writeOutput(writer, output)
+	//output := translate.DeleteTerminologyOutput{}
+	//writeOutput(writer, output)
 }
 
 ////////////////////////////////////////////////////////////////////////////////

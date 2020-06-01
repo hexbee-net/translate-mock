@@ -19,9 +19,12 @@ import (
 )
 
 type Config struct {
-	StartDelay          time.Duration
-	StopDelay           time.Duration
-	ThrottlingThreshold int
-	ThrottlingPeriod    time.Duration
-	ErrorRate           int
+	JobDuration          time.Duration // Time for a job to reach completion one it is started.
+	JobDurationDeviation time.Duration // Standard deviation of the job completion time.
+	StartDelay           time.Duration // Delay between when a job is submitted and when it actually starts.
+	StopDelay            time.Duration // Delay between when a job stop is requested and when the job actually stops.
+	ThrottlingThreshold  int           // Max number of calls authorized during the throttling period. 0 means not throttling.
+	ThrottlingPeriod     time.Duration // Duration of the throttling period. If the number of calls exceeds throttling-threshold during this period, the call will fail.
+	ErrorRate            float64       // Percentage of documents with errors on completion for each job.
+	FailRate             int           // Probability of jobs failure in each update cycle.
 }
